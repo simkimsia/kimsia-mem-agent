@@ -7,23 +7,6 @@ from minisweagent.models.litellm_model import LitellmModel
 from env import SshEnvironment
 from agent import MemoryAgent
 
-def _extract_submission(status, result):
-    status_norm = str(status).strip().lower()
-    patch_text = ''
-
-    if isinstance(result, dict):
-        patch_text = str(result.get('submission', '') or result.get('patch', ''))
-        if not status_norm:
-            status_norm = str(result.get('exit_status', '')).strip().lower()
-    elif isinstance(result, str):
-        patch_text = result
-
-    is_submitted = status_norm in {'submitted', 'submit'}
-    has_diff = isinstance(patch_text, str) and ('diff --git ' in patch_text)
-    has_patch = isinstance(patch_text, str) and bool(patch_text.strip())
-
-    return (is_submitted and has_patch) or has_diff, patch_text, status_norm
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--instance-path', required=True)
@@ -50,7 +33,7 @@ def main():
 
     model_name = os.environ.get('MODEL_NAME', config['model']['model_name'])
 
-    print('agent started! model=', model_name)
+    print('agent started!', model_name)
 
     agent = MemoryAgent(
         args.memory_path,
@@ -83,13 +66,10 @@ def main():
     status, result = agent.run(task)
     agent.save_memory()
     
-    should_write_patch, patch_text, status_norm = _extract_submission(status, result)
-    print('done! status:', status, 'status_norm=', status_norm, 'result_type=', type(result).__name__)
-
-    if should_write_patch:
+    print('done! status:', status)
+    if status == 'Submitted':
         with open(f'{args.instance_path}/patch.diff', 'w') as f:
-            f.write(patch_text)
-        print('patch written. size=', len(patch_text))
+            f.write(result)
     else:
         print(result)
 
