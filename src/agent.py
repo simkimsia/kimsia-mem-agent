@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from minisweagent.agents.default import DefaultAgent, LimitsExceeded
+from pattern_memory import PatternMemory
 
 class MemoryAgent(DefaultAgent):
     def __init__(self, memory_path: str, *args, **kwargs):
@@ -11,6 +12,13 @@ class MemoryAgent(DefaultAgent):
         self.max_memory_messages = int(os.environ.get('MEMORY_MAX_MESSAGES', '30'))
         self.max_memory_chars = int(os.environ.get('MEMORY_MAX_CHARS', '1800'))
         self.memorized_messages = []
+        model_kwargs = getattr(getattr(self.model, "config", None), "model_kwargs", {}) or {}
+        self.pattern_memory = PatternMemory(
+            memory_dir=memory_path,
+            api_base=str(model_kwargs.get("api_base", "")),
+            api_key=str(model_kwargs.get("api_key", "")),
+        )
+        self.pattern_prompt = ""
         self.load_memory()
 
     def _compact_messages(self, messages: list[dict]) -> list[dict]:
@@ -75,6 +83,18 @@ class MemoryAgent(DefaultAgent):
 
         print(f'spend so far: key {key_spend}, user {user_spend}')
 
+    def run(self, task: str):
+        selected = self.pattern_memory.retrieve_for_task(task)
+        self.pattern_prompt = self.pattern_memory.build_prompt_block(selected)
+        if selected:
+            print(f'retrieved {len(selected)} pattern memories')
+
+        status, result = super().run(task)
+
+        submitted = str(status).strip().lower() == 'submitted'
+        self.pattern_memory.learn_from_run(self.messages[1:], submitted=submitted)
+        return status, result
+
     def query(self) -> dict:
         """Query the model and return the response."""
 
@@ -85,8 +105,18 @@ class MemoryAgent(DefaultAgent):
         print(f'query llm: step {self.model.n_calls}')
         
         # insert memorized messages after the first message (system prompt)
+        pattern_block = []
+        if self.pattern_prompt:
+            pattern_block.append(
+                {
+                    "role": "user",
+                    "content": self.pattern_prompt,
+                    "timestamp": time.time(),
+                }
+            )
         messages = [
             *self.messages[:1],
+            *pattern_block,
             *self.memorized_messages,
             *self.messages[1:]
         ]
