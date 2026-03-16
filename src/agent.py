@@ -92,7 +92,7 @@ class MemoryAgent(DefaultAgent):
         status, result = super().run(task)
 
         submitted = str(status).strip().lower() == 'submitted'
-        self.pattern_memory.learn_from_run(self.messages[1:], submitted=submitted)
+        self.pattern_memory.learn_from_run(task, self.messages[1:], submitted=submitted)
         return status, result
 
     def query(self) -> dict:
