@@ -278,6 +278,8 @@ class MemoryAgent(DefaultAgent):
     def _sr_run_critic(self, task: str, changed_files: list[str]) -> dict:
         """Pass B: one LLM call to critique the diff. Returns parsed critic result."""
         self.sr_extra_steps_used += 1
+        fallback = {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
+        max_retries = int(os.environ.get('SELF_REVIEW_CRITIC_RETRIES', '2'))
 
         # collect diff (prefer staged to match submitted patch)
         r = self.env.execute('git diff --cached -U0')
@@ -295,27 +297,39 @@ class MemoryAgent(DefaultAgent):
             )},
         ]
 
-        try:
-            response = self.model.query(critic_messages)
-            raw_content = response.get('content', '')
-            print(f'[self-review] critic raw: {raw_content[:500]}')
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.model.query(critic_messages)
+                raw_content = response.get('content', '')
+                print(f'[self-review] critic raw: {raw_content[:500]}')
 
-            # try to extract JSON from response (may have markdown fences)
-            json_match = re.search(r'\{[\s\S]*\}', raw_content)
-            if not json_match:
-                print('[self-review] critic parse failed: no JSON found')
-                return {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
+                # try to extract JSON from response (may have markdown fences)
+                json_match = re.search(r'\{[\s\S]*\}', raw_content)
+                if not json_match:
+                    print('[self-review] critic parse failed: no JSON found')
+                    return fallback
 
-            parsed = json.loads(json_match.group())
-            return {
-                'risk_level': str(parsed.get('risk_level', 'low')),
-                'off_target': bool(parsed.get('off_target', False)),
-                'reasons': list(parsed.get('reasons', [])),
-                'actions': list(parsed.get('actions', [])),
-            }
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            print(f'[self-review] critic parse failed: {e}')
-            return {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
+                parsed = json.loads(json_match.group())
+                return {
+                    'risk_level': str(parsed.get('risk_level', 'low')),
+                    'off_target': bool(parsed.get('off_target', False)),
+                    'reasons': list(parsed.get('reasons', [])),
+                    'actions': list(parsed.get('actions', [])),
+                }
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                print(f'[self-review] critic parse failed: {e}')
+                return fallback
+            except Exception as e:
+                msg = str(e)
+                retryable = ('429' in msg) or ('ratelimit' in msg.lower()) or ('busy' in msg.lower())
+                if retryable and attempt < max_retries:
+                    backoff_s = 2 ** attempt
+                    print(f'[self-review] critic transient failure, retrying in {backoff_s}s: {e}')
+                    time.sleep(backoff_s)
+                    continue
+                print(f'[self-review] critic query failed, skipping review: {e}')
+                return fallback
+        return fallback
 
     def _sr_run_revise(self, actions: list[str]) -> None:
         """Inject critic feedback and allow one revise cycle."""
@@ -445,7 +459,10 @@ class MemoryAgent(DefaultAgent):
 
         # Self-review: only when enabled and agent submitted a patch
         if self.sr_enabled and str(status).strip().lower() == 'submitted':
-            status, result = self._run_self_review(task, status, result)
+            try:
+                status, result = self._run_self_review(task, status, result)
+            except Exception as e:
+                self._sr_log(phase='error', error=str(e))
 
         submitted = str(status).strip().lower() == 'submitted'
         self.pattern_memory.learn_from_run(task, self.messages[1:], submitted=submitted)
