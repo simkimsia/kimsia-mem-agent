@@ -2,158 +2,178 @@
 
 ## Context
 
-Goal: improve SWE-Bench Pro pass rate via memory, without hardcoding repo-specific logic into agent control flow.
+Goal: improve SWE-Bench Pro pass rate via memory without hardcoding repo-specific behavior in agent control flow.
 
-This proposal consolidates guidance from recent analysis of `element-web` and `NodeBB` archive runs.
+This version is feasibility-corrected to match harness constraints.
+
+## Hard Constraints From Competition Interface
+
+1. `--memory-path` is empty at project start.
+2. Memory persists only between tasks in the same project.
+3. Memory is not preserved across projects.
+4. Agent process does not receive post-run evaluator verdicts during the solve loop.
+
+Implications:
+
+1. no cross-project bootstrap memory during official eval,
+2. no runtime use of `verdict_val.json`/harness post-eval artifacts,
+3. no true success/failure feedback loop from evaluator inside the agent.
+
+## Corrected Value Chain
+
+With project-local sequential execution, practical gains come from:
+
+1. **Instance 1:** cold start (recon + robust solving discipline).
+2. **Instance 2+:** reuse extracted memory from earlier instances in same project.
+
+So extraction quality on early instances is disproportionately important.
 
 ## Position
 
-Do **not** hardcode repo behavior in `agent.py`.
+Do not hardcode repo logic in `agent.py`.
 
-Use **repo-scoped, confidence-weighted memory**:
+Use project-local memory as data:
 
-1. Keep agent logic generic.
-2. Store project-specific lessons as memory records.
-3. Retrieve only relevant records for the current project/task.
-4. Inject as conditional checks, not rigid instructions.
+1. encode lessons as reusable records,
+2. inject as conditional checks,
+3. keep agent loop generic.
 
-## Why This Is Better Than Hardcoding
+## What Is Actually Achievable
 
-Hardcoding:
+### 1) Intra-instance memory (same task, run-local)
 
-1. Overfits to known repos/issues.
-2. Risks regressions on unseen projects.
-3. Does not scale across 200 benchmark instances.
+Use signals from commands/tests run by the agent during the same solve loop:
 
-Memory-based adaptation:
+1. parse failing test output from trajectory observations,
+2. summarize as temporary failure fingerprints,
+3. feed into revise/checklist prompt before final submit command.
 
-1. Preserves generic reasoning loop.
-2. Lets project conventions emerge from evidence.
-3. Improves over time with accumulated episodes.
+This does not require persistence and works within one run.
 
-## Key Concern: “Memory Helps Only After Eval”
+### 2) Inter-instance memory (same project, persisted)
 
-True for post-episode memory on the current instance. Mitigation is a 3-layer strategy:
+After each task:
 
-1. **Intra-instance memory (same task):**
-   - During the run, capture failing-test signals and feed them into revise-before-submit checks.
-2. **Inter-instance memory (same project sequence):**
-   - After each evaluated instance, persist validated lessons for later instances in that project.
-3. **Cross-run bootstrap memory:**
-   - Seed memory DB from prior runs/devset so early instances are not memory-cold.
+1. extract memories from trajectory + test output observed by the agent,
+2. store in `/mnt/memory`,
+3. retrieve for next tasks in the same project.
 
-This aligns with Mem-Comp’s sequential-per-project setup, where N can help N+1...N+25.
+## Retrieval Strategy (Adjusted)
 
-## Concrete Changes (Recommended First Wave)
+Given harness already scopes memory per project directory, project filtering is effectively implicit.
 
-### 1) Retrieval Guardrails
+First-wave retrieval should optimize precision over complexity:
 
-Current risk: retrieval query is global vector search with no project filter.
+1. vector retrieve top-k small (`k=3` default),
+2. rerank by semantic similarity + specificity heuristic,
+3. dedupe near-identical memories by normalized content/target.
 
-Change:
+Optional defensive project filter remains acceptable for local mixed-run tooling, but not required for harness correctness.
 
-1. Add project-aware retrieval filtering.
-2. Optionally add recency and confidence weighting.
-3. Keep top-k small and high precision.
+## Memory Quality Without Eval Outcome Feedback
 
-Expected effect: lower cross-repo contamination.
+Because evaluator outcomes are unavailable in-process, avoid claiming `success/failure` supervision from harness verdicts.
 
-### 2) Memory Quality Signals
+Use weak but available signals:
 
-Current risk: memories are stored without validation confidence.
+1. whether agent produced a patch vs crash/nopatch,
+2. whether memory was injected,
+3. whether injected memory target overlapped changed files/tests run,
+4. whether agent's own rerun tests after edits improved (if present in trajectory).
 
-Change:
+These are proxies, not ground-truth correctness.
 
-1. Extend memory record metadata with:
-   - `confidence`
-   - `uses`
-   - `successes`
-   - `failures`
-   - optional `tests_touched` / `failure_signature`
-2. Update stats after each episode outcome.
-3. Inject only above confidence threshold.
+## Extraction Upgrade (Feasible Inputs Only)
 
-Expected effect: reduce noisy/one-off memories.
+Do not rely on post-run eval files.
 
-### 3) Failure-Fingerprint Extraction
+Extract from:
 
-Current extractor is trajectory-heuristic heavy.
+1. agent trajectory observation messages (`<returncode>`, `<output>`),
+2. test command output run during solving,
+3. explicit assertion blocks (`Expected/Received`, failing test names, stack line hints).
 
-Change:
+Store failure fingerprint only when structured enough:
 
-1. Parse eval artifacts for structured failure signatures:
-   - test name
-   - expected vs received
-   - target file/function hints
-2. Convert repeated signatures into correction/pattern memories.
+1. at least one stable test identifier, and
+2. at least one concrete assertion/error snippet.
 
-Expected effect: capture reusable debugging knowledge for similar failures.
+## Injection Format Upgrade (High ROI, Low Risk)
 
-### 4) Injection Format Upgrade
+Current generic list should be replaced with actionable conditional checks.
 
-Current format is generic list text.
+Format target:
 
-Change:
+1. “If touching X and seeing Y, verify Z before submit.”
 
-1. Inject memory as conditional operational checks:
-   - “If touching X and seeing failure Y, verify Z before submit.”
-2. Include short provenance (task + confidence).
-3. Cap token footprint aggressively.
+Token budget (explicit):
 
-Expected effect: better actionability, less prompt clutter.
+1. hard cap 350 tokens total,
+2. max 4 memories,
+3. max ~70 tokens each,
+4. drop low-specificity/redundant entries first.
 
-### 5) Two-Pass Integration (Optional but Valuable)
+## Budget-Aware Extraction
 
-Current issue in observed failing element-web instance: self-review skipped because risk gate thresholds not crossed (`changed_files=2`, small diff), despite semantic risk.
+Extraction has non-trivial cost overhead.
 
-Change:
+Policy:
 
-1. Add semantic trigger to self-review gate:
-   - if retrieved memory confidence high and changed files intersect memory targets, force critic pass.
-2. Keep step budget cap.
+1. if remaining budget below threshold, skip LLM extraction and use heuristic-only extraction,
+2. always prefer solving budget over memory extraction budget.
 
-Expected effect: self-review runs when it matters semantically, not only by diff size.
+## Memory Pruning / Noise Control
 
-## What This Means for element-web Sticky-Room Failure
+Need active pruning to avoid memory quality decay over 25 tasks.
 
-Do not hardcode a rule in agent flow for `element-web`.
+Pruning policy:
 
-Instead store a project-scoped correction memory like:
+1. remove stale low-specificity memories,
+2. merge duplicates by normalized trigger/action,
+3. cap memory count per project and evict lowest utility first.
 
-1. When editing `useStickyRoomList` / `SpaceStore` for space-switch behavior, validate active index against last-selected-room semantics (`RoomListViewModel` sticky-room test expectations).
+## Two-Pass / Semantic Self-Review Trigger
 
-This remains soft guidance and only activates when retrieval says it is relevant.
+Keep out of first-wave memory rollout.
 
-## Evaluation Plan
+Reason:
 
-### A/B Setup
+1. invasive control-flow coupling,
+2. uncertain ROI compared with extraction+injection improvements,
+3. can be revisited after memory quality improvements stabilize.
 
-1. Baseline: current memory behavior.
-2. Variant: project-filtered + confidence-weighted + failure-fingerprint extraction + improved injection.
+## Evaluation Plan (Revised)
 
-### Metrics
+### A/B
 
-1. Resolved count per project.
-2. Precision of injected memories (manual audit sample).
-3. % of instances where injected memory references touched files/tests.
-4. Regression rate from irrelevant memory.
-5. Cost/time overhead.
+1. Baseline: current extraction + injection.
+2. Variant: improved extraction from run-time test output + conditional injection + pruning + budget fallback.
 
-### Acceptance Gates
+### Primary metric
 
-1. Improved resolved count on at least 2 projects (or no drop with lower variance).
-2. Reduced noisy injections.
-3. No increase in crash/nopatch incidents.
+1. resolved count.
+
+### Secondary metrics (quality)
+
+1. Injection Precision@k (manual/sample audit),
+2. Irrelevant Injection Rate,
+3. Specificity score (penalize broad/generic memories),
+4. memory growth vs retrieval quality trend,
+5. runtime/cost overhead.
 
 ## Rollout Order
 
-1. Project-scoped retrieval filter.
-2. Confidence metadata + gating.
-3. Failure-signature extraction from eval logs.
-4. Injection template upgrade.
-5. Optional semantic self-review trigger.
+1. injection format upgrade,
+2. extraction upgrade from run-time test output,
+3. budget-aware extraction fallback,
+4. pruning/eviction,
+5. optional retrieval rerank refinements.
 
 ## Summary
 
-Best path is not hardcoded repo behavior.  
-Best path is stronger memory quality control + project-scoped retrieval + actionable injection, with explicit handling for the “post-eval memory timing” limitation via intra/inter-instance strategy.
+Feasible path under competition constraints:
+
+1. no cross-project bootstrap assumptions,
+2. no reliance on post-eval artifacts,
+3. prioritize extraction quality + injection actionability,
+4. treat inter-instance memory (same project) as the main compounding advantage.
