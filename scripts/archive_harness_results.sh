@@ -84,11 +84,8 @@ fix_ownership() {
   if [[ ! -e "${target}" ]]; then
     return 0
   fi
-  if [[ -w "${target}" ]]; then
-    return 0
-  fi
   if command -v sudo >/dev/null 2>&1; then
-    # Ask for password if needed; this is expected on VPS.
+    # Best-effort ownership fix for root-owned previous runs.
     sudo chown -R "${USER}:$(id -gn)" "${target}" || true
   fi
 }
@@ -105,10 +102,23 @@ shopt -u dotglob
 if [[ ${#items[@]} -eq 0 ]]; then
   echo "nothing to archive: ${RESULTS_DIR} is empty"
 else
-  mv "${items[@]}" "${ARCHIVE_RESULTS_DIR}/"
+  for item in "${items[@]}"; do
+    if ! mv "${item}" "${ARCHIVE_RESULTS_DIR}/" 2>/dev/null; then
+      if command -v sudo >/dev/null 2>&1; then
+        sudo mv "${item}" "${ARCHIVE_RESULTS_DIR}/"
+      else
+        echo "error: failed to move ${item} and sudo is unavailable" >&2
+        exit 1
+      fi
+    fi
+  done
 fi
 
 mkdir -p "${RESULTS_DIR}"
+
+# Normalize ownership on archive and fresh results after sudo fallback move.
+fix_ownership "${ARCHIVE_DIR}"
+fix_ownership "${RESULTS_DIR}"
 
 cat > "${ARCHIVE_DIR}/ARCHIVE_META.txt" <<EOF
 timestamp: ${TS}
