@@ -352,7 +352,7 @@ class MemoryAgent(DefaultAgent):
             "Required actions:\n" +
             '\n'.join(f'- {a}' for a in actions) +
             "\n\nAfter fixing, submit again with:\n"
-            "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```"
+            "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git reset && git add -u && git diff --cached\n```"
         )
         self._sr_push_messages(
             {
