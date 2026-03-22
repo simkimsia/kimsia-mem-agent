@@ -199,13 +199,20 @@ class MemoryAgent(DefaultAgent):
 
     def _sr_compute_risk_signals(self, task: str) -> dict:
         """Risk gate: gather signals via SSH, return metrics + should_review."""
-        # git diff --name-only
-        r1 = self.env.execute('git diff --name-only')
+        # Prefer staged diff (submit path uses git diff --cached), fallback to unstaged.
+        r1 = self.env.execute('git diff --cached --name-only')
         changed_files = [f for f in r1.get('output', '').strip().split('\n') if f.strip()]
+        diff_source = 'cached'
+        if not changed_files:
+            r1 = self.env.execute('git diff --name-only')
+            changed_files = [f for f in r1.get('output', '').strip().split('\n') if f.strip()]
+            diff_source = 'working'
         changed_count = len(changed_files)
 
-        # git diff --numstat
-        r2 = self.env.execute('git diff --numstat')
+        # Prefer staged numstat, fallback to unstaged.
+        r2 = self.env.execute('git diff --cached --numstat')
+        if not r2.get('output', '').strip():
+            r2 = self.env.execute('git diff --numstat')
         diff_lines = 0
         for line in r2.get('output', '').strip().split('\n'):
             parts = line.split('\t')
@@ -233,6 +240,7 @@ class MemoryAgent(DefaultAgent):
         metrics = {
             'changed_files': changed_count,
             'changed_file_list': changed_files,
+            'diff_source': diff_source,
             'diff_lines': diff_lines,
             'target_overlap': round(target_overlap, 3),
             'should_review': len(reasons) > 0,
@@ -271,8 +279,10 @@ class MemoryAgent(DefaultAgent):
         """Pass B: one LLM call to critique the diff. Returns parsed critic result."""
         self.sr_extra_steps_used += 1
 
-        # collect diff
-        r = self.env.execute('git diff -U0')
+        # collect diff (prefer staged to match submitted patch)
+        r = self.env.execute('git diff --cached -U0')
+        if not r.get('output', '').strip():
+            r = self.env.execute('git diff -U0')
         raw_diff = r.get('output', '')
         diff = self._sr_truncate_diff(raw_diff)
 
