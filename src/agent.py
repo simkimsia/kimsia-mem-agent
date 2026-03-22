@@ -332,18 +332,30 @@ class MemoryAgent(DefaultAgent):
             "\n\nAfter fixing, submit again with:\n"
             "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```"
         )
-        self.add_messages(self.model.format_message(role='user', content=feedback))
+        self._sr_push_messages(self.model.format_message(role='user', content=feedback))
 
         # mini step loop — allow some iterations for format errors etc.
         for _ in range(15):
             try:
                 self.step()
             except InterruptAgentFlow as e:
-                self.add_messages(*e.messages)
+                self._sr_push_messages(*(e.messages or []))
             except Exception:
                 break
             if self.messages[-1].get('role') == 'exit':
                 break
+
+    def _sr_push_messages(self, *messages) -> None:
+        """Append one or more pre-formatted messages safely."""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get('role')
+            if not role:
+                continue
+            payload = dict(msg)
+            payload.pop('role', None)
+            self.add_message(role, **payload)
 
     def _sr_load_rules(self, task: str) -> list[str]:
         """Load matching rules from rules_memory.json if it exists."""
