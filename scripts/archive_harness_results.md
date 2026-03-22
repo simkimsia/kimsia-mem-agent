@@ -64,4 +64,5 @@ sudo -E "$(pwd)/.venv/bin/python" main.py | tee run_new.log
 ```bash
 ./scripts/archive_harness_results.sh --help
 ```
-4. For root-owned run folders, the script uses `sudo chown` (best-effort) and `sudo mv` fallback automatically.
+
+For root-owned run folders, the script uses `sudo chown` (best-effort) and `sudo mv` fallback automatically.

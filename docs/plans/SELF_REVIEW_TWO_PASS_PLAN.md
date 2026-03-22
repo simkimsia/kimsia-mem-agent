@@ -119,6 +119,78 @@ Log to `_harness/agent.log`:
 ]
 ```
 
+## How to Run
+
+### Step 0: Use tmux session `memcomp`
+
+```bash
+tmux attach -t memcomp || tmux new -s memcomp
+```
+
+Run all following commands inside this tmux session so the eval keeps running if SSH disconnects.
+
+### Step 1: Archive previous results
+
+Before starting a new experiment, archive existing harness results so they don't mix with the new run.
+
+```bash
+cd ~/projects/kimsia-mem-agent
+./scripts/archive_harness_results.sh \
+  --harness ~/projects/mem-comp-26/harness \
+  --label "baseline nomem v1 at 7/9 before two-pass self-review"
+```
+
+See `scripts/archive_harness_results.md` for full usage details.
+
+### Step 2: Back up and replace candidates.json
+
+```bash
+cd ~/projects/mem-comp-26/harness
+
+# backup first (timestamped)
+cp candidates.json "candidates.backup.$(date +%Y%m%d_%H%M%S).json"
+
+# replace with self-review experiment candidate
+cat > candidates.json <<'JSON'
+[
+  {
+    "run_name": "kimsia_glm47_nomem_selfreview_v1",
+    "agent_docker_image": "kimsia-mem-agent:latest",
+    "llm_quota_total": 200,
+    "llm_quota_instance": 2,
+    "enable_memory": false,
+    "timeout_s": 7200,
+    "env": {
+      "MODEL_NAME": "litellm_proxy/glm-4.7",
+      "SELF_REVIEW_ENABLED": "1",
+      "SELF_REVIEW_MAX_EXTRA_STEPS": "2",
+      "SELF_REVIEW_MAX_EXTRA_COST": "0.15",
+      "SELF_REVIEW_MAX_CHANGED_FILES": "3",
+      "SELF_REVIEW_MAX_DIFF_LINES": "120"
+    }
+  }
+]
+JSON
+```
+
+### Step 3: Rebuild the Docker image on VPS
+
+```bash
+cd ~/projects/kimsia-mem-agent
+docker build -t kimsia-mem-agent:latest .
+```
+
+### Step 4: Run the harness on VPS
+
+```bash
+cd ~/projects/mem-comp-26/harness
+sudo -E "$(pwd)/.venv/bin/python" main.py | tee run_selfreview_v1.log
+```
+
+### Step 5: Check results
+
+Inspect the log for `[self-review]` lines to see whether the risk gate triggered, what the critic said, and whether revise was applied. Then check verdict files against the validation gates below.
+
 ## Validation Gates
 
 1. 9 verdict files produced
@@ -129,9 +201,12 @@ Log to `_harness/agent.log`:
 
 ## Rollback
 
-1. Set `SELF_REVIEW_ENABLED=0` (or remove self-review env vars)
-2. Re-run baseline candidate
-3. No harness code rollback required
+1. Restore previous candidate config from your backup file:
+   - `cp candidates.backup.<timestamp>.json candidates.json`
+2. Or disable self-review in-place:
+   - set `SELF_REVIEW_ENABLED=0` (or remove self-review env vars)
+3. Re-run baseline candidate
+4. No harness code rollback required
 
 ## How to Turn Off Self-Review
 
