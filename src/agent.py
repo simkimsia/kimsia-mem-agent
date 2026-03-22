@@ -4,7 +4,16 @@ import json
 import time
 import requests
 from minisweagent.agents.default import DefaultAgent, LimitsExceeded
-from minisweagent.exceptions import InterruptAgentFlow
+try:
+    from minisweagent.exceptions import InterruptAgentFlow
+except Exception:
+    try:
+        from minisweagent.agents.default import InterruptAgentFlow
+    except Exception:
+        class InterruptAgentFlow(Exception):
+            def __init__(self, *args, messages=None, **kwargs):
+                super().__init__(*args)
+                self.messages = list(messages or [])
 from pattern_memory import PatternMemory
 
 # ---------------------------------------------------------------------------
