@@ -132,3 +132,33 @@ Log to `_harness/agent.log`:
 1. Set `SELF_REVIEW_ENABLED=0` (or remove self-review env vars)
 2. Re-run baseline candidate
 3. No harness code rollback required
+
+## How to Turn Off Self-Review
+
+Three ways to disable, all equivalent:
+
+1. **Don't set the env var** — `SELF_REVIEW_ENABLED` defaults to `0`, so the feature is off unless explicitly opted in.
+2. **Set `SELF_REVIEW_ENABLED=0`** in the `env` block of `candidates.json`.
+3. **Remove the self-review env vars entirely** from the candidate config — the agent falls back to baseline behavior.
+
+## What Changed in `agent.py`
+
+### Added (inert when disabled)
+
+- **Imports** (top of file): `re`, `InterruptAgentFlow` — only used by self-review helpers.
+- **Constants** (module level): `_STOPWORDS`, `_GENERIC_TOKENS`, regex patterns, critic prompt templates — never evaluated at runtime when disabled.
+- **Config parsing** (`__init__`): reads `SELF_REVIEW_ENABLED`, `SELF_REVIEW_MAX_EXTRA_STEPS`, `SELF_REVIEW_MAX_CHANGED_FILES`, `SELF_REVIEW_MAX_DIFF_LINES` from env. Only side effect when disabled is reading env vars.
+- **Helper methods** (`_sr_*`): `_sr_extract_general_keywords`, `_sr_extract_explicit_paths`, `_sr_compute_target_overlap`, `_sr_compute_risk_signals`, `_sr_truncate_diff`, `_sr_run_critic`, `_sr_run_revise`, `_sr_load_rules`, `_sr_log`, `_run_self_review` — none are called when `sr_enabled` is `False`.
+- **Gate in `run()`**: a single `if self.sr_enabled and status == 'submitted'` check after `super().run(task)` returns.
+
+### Not Changed
+
+- `_compact_messages()` — untouched.
+- `load_memory()` / `save_memory()` — untouched.
+- `print_spend()` — untouched.
+- `query()` — untouched.
+- The `super().run(task)` call and `pattern_memory.learn_from_run()` — same position and logic.
+- `config.yaml` — no changes.
+- `main.py` — no changes.
+- `env.py` — no changes.
+- Harness code — no changes.
