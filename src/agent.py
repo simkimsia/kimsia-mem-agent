@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import random
 import requests
 from minisweagent.agents.default import DefaultAgent, LimitsExceeded
 try:
@@ -76,6 +77,13 @@ class MemoryAgent(DefaultAgent):
         self.sr_max_changed_files = int(os.environ.get('SELF_REVIEW_MAX_CHANGED_FILES', '3'))
         self.sr_max_diff_lines = int(os.environ.get('SELF_REVIEW_MAX_DIFF_LINES', '120'))
         self.sr_extra_steps_used = 0
+        self.query_max_retries = int(os.environ.get('MODEL_QUERY_MAX_RETRIES', '6'))
+        self.query_backoff_base_s = float(os.environ.get('MODEL_QUERY_BACKOFF_BASE_S', '1.0'))
+        self.query_backoff_max_s = float(os.environ.get('MODEL_QUERY_BACKOFF_MAX_S', '20.0'))
+        self.query_backoff_jitter_s = float(os.environ.get('MODEL_QUERY_BACKOFF_JITTER_S', '0.35'))
+        self.query_min_interval_s = float(os.environ.get('MODEL_QUERY_MIN_INTERVAL_S', '0.0'))
+        self.print_spend_enabled = os.environ.get('PRINT_SPEND', '1') == '1'
+        self._last_query_at = 0.0
         if self.sr_enabled:
             print(f'self-review enabled: max_extra_steps={self.sr_max_extra_steps}, '
                   f'max_changed_files={self.sr_max_changed_files}, max_diff_lines={self.sr_max_diff_lines}')
@@ -468,13 +476,37 @@ class MemoryAgent(DefaultAgent):
         self.pattern_memory.learn_from_run(task, self.messages[1:], submitted=submitted)
         return status, result
 
+    def _is_retryable_query_error(self, err: Exception) -> bool:
+        msg = str(err).lower()
+        retry_markers = (
+            '429',
+            'ratelimit',
+            'rate limit',
+            'throttl',
+            'too many requests',
+            'model busy',
+            'retry later',
+            'service unavailable',
+            'temporarily unavailable',
+            'timeout',
+            'timed out',
+            'connection reset',
+            'connection aborted',
+            'econnreset',
+            '503',
+            '502',
+            '504',
+        )
+        return any(marker in msg for marker in retry_markers)
+
     def query(self) -> dict:
         """Query the model and return the response."""
 
         if 0 < self.config.step_limit <= self.model.n_calls or 0 < self.config.cost_limit <= self.model.cost:
             raise LimitsExceeded()
-        
-        self.print_spend()
+
+        if self.print_spend_enabled:
+            self.print_spend()
         print(f'query llm: step {self.model.n_calls}')
         
         # insert memorized messages after the first message (system prompt)
@@ -494,6 +526,34 @@ class MemoryAgent(DefaultAgent):
             *self.messages[1:]
         ]
 
-        response = self.model.query(messages)
+        if self.query_min_interval_s > 0 and self._last_query_at > 0:
+            since_last = time.monotonic() - self._last_query_at
+            if since_last < self.query_min_interval_s:
+                sleep_s = self.query_min_interval_s - since_last
+                print(f'query llm: pacing sleep {sleep_s:.2f}s')
+                time.sleep(sleep_s)
+
+        response = None
+        for attempt in range(self.query_max_retries + 1):
+            try:
+                response = self.model.query(messages)
+                self._last_query_at = time.monotonic()
+                break
+            except Exception as e:
+                retryable = self._is_retryable_query_error(e)
+                if not retryable or attempt >= self.query_max_retries:
+                    raise
+                backoff = min(self.query_backoff_max_s, self.query_backoff_base_s * (2 ** attempt))
+                jitter = random.uniform(0, self.query_backoff_jitter_s)
+                sleep_s = backoff + jitter
+                print(
+                    f'query llm: transient provider error (attempt {attempt + 1}/{self.query_max_retries + 1}), '
+                    f'retrying in {sleep_s:.2f}s: {e}'
+                )
+                time.sleep(sleep_s)
+
+        if response is None:
+            raise RuntimeError('model query failed with no response')
+
         self.add_message('assistant', **response)
         return response
