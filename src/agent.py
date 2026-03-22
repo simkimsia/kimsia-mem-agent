@@ -1,9 +1,49 @@
 import os
+import re
 import json
 import time
 import requests
 from minisweagent.agents.default import DefaultAgent, LimitsExceeded
+from minisweagent.exceptions import InterruptAgentFlow
 from pattern_memory import PatternMemory
+
+# ---------------------------------------------------------------------------
+# Self-review constants
+# ---------------------------------------------------------------------------
+_STOPWORDS = frozenset({
+    'this', 'that', 'with', 'from', 'should', 'have', 'been', 'will', 'when',
+    'they', 'them', 'their', 'than', 'then', 'also', 'some', 'into', 'more',
+    'what', 'were', 'does', 'like', 'only', 'just', 'very', 'your', 'about',
+    'which', 'could', 'other', 'would', 'there', 'these', 'those', 'after',
+    'before', 'being', 'using', 'because',
+})
+_GENERIC_TOKENS = frozenset({
+    'file', 'test', 'make', 'each', 'data', 'code', 'line', 'type', 'name',
+    'function', 'method', 'class', 'module', 'import', 'return', 'value',
+    'error', 'print', 'string', 'number', 'list', 'dict', 'true', 'false',
+    'none', 'added', 'removed', 'change', 'changes', 'update', 'updates',
+})
+_IDENTIFIER_RE = re.compile(r'[a-z]+[A-Z]|[A-Z][a-z]+[A-Z]|_|-')
+_PATH_RE = re.compile(r'(?:^|[\s\'"`(])([a-zA-Z0-9_./-]+\.(?:ts|tsx|js|jsx|py|rb|go|rs|java|c|cpp|h|hpp|css|scss|html))\b')
+_FULL_PATH_RE = re.compile(r'(?:^|[\s\'"`(])((?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+)\b')
+_DIFF_HUNK_RE = re.compile(r'^@@\s', re.MULTILINE)
+
+_CRITIC_SYSTEM = "You are a strict code-review critic. Respond with ONLY valid JSON, no markdown fences."
+_CRITIC_USER = """\
+Task summary (first 500 chars):
+{task_summary}
+
+Changed files:
+{changed_files}
+
+Diff (-U0, possibly truncated):
+{diff}
+
+Question: Is this patch off-target or risky?
+If yes, list exact corrective actions the developer should take.
+
+Respond with ONLY this JSON schema:
+{{"risk_level": "low|medium|high", "off_target": true/false, "reasons": ["..."], "actions": ["..."]}}"""
 
 class MemoryAgent(DefaultAgent):
     def __init__(self, memory_path: str, *args, **kwargs):
@@ -20,6 +60,16 @@ class MemoryAgent(DefaultAgent):
         )
         self.pattern_prompt = ""
         self.load_memory()
+
+        # Self-review config (all off by default — baseline unchanged)
+        self.sr_enabled = os.environ.get('SELF_REVIEW_ENABLED', '0') == '1'
+        self.sr_max_extra_steps = int(os.environ.get('SELF_REVIEW_MAX_EXTRA_STEPS', '2'))
+        self.sr_max_changed_files = int(os.environ.get('SELF_REVIEW_MAX_CHANGED_FILES', '3'))
+        self.sr_max_diff_lines = int(os.environ.get('SELF_REVIEW_MAX_DIFF_LINES', '120'))
+        self.sr_extra_steps_used = 0
+        if self.sr_enabled:
+            print(f'self-review enabled: max_extra_steps={self.sr_max_extra_steps}, '
+                  f'max_changed_files={self.sr_max_changed_files}, max_diff_lines={self.sr_max_diff_lines}')
 
     def _compact_messages(self, messages: list[dict]) -> list[dict]:
         compacted = []
@@ -83,6 +133,271 @@ class MemoryAgent(DefaultAgent):
 
         print(f'spend so far: key {key_spend}, user {user_spend}')
 
+    # ------------------------------------------------------------------
+    # Self-review helpers
+    # ------------------------------------------------------------------
+
+    def _sr_extract_general_keywords(self, task: str) -> set[str]:
+        """Step 1: extract high-signal identifier-like tokens from task text."""
+        tokens = set()
+        for word in re.findall(r'[A-Za-z0-9_.-]+', task.lower()):
+            if len(word) < 4:
+                continue
+            if word in _STOPWORDS or word in _GENERIC_TOKENS:
+                continue
+            # keep identifier-like tokens (camelCase, snake_case, has _ or -)
+            if _IDENTIFIER_RE.search(word):
+                tokens.add(word)
+            # also keep anything that looks domain-specific (not pure english)
+            elif '_' in word or '-' in word:
+                tokens.add(word)
+            # keep PascalCase-ish tokens from original case
+            elif any(c.isupper() for c in word[1:]):
+                tokens.add(word)
+        # also extract original-case identifiers
+        for word in re.findall(r'[A-Za-z_][A-Za-z0-9_]+', task):
+            if len(word) >= 4 and (_IDENTIFIER_RE.search(word) or '_' in word):
+                tokens.add(word.lower())
+        return tokens
+
+    def _sr_extract_explicit_paths(self, task: str) -> set[str]:
+        """Step 2: regex-extract full file/path strings from task text."""
+        paths = set()
+        for m in _PATH_RE.finditer(task):
+            paths.add(m.group(1))
+        for m in _FULL_PATH_RE.finditer(task):
+            candidate = m.group(1)
+            if '/' in candidate and not candidate.startswith('http'):
+                paths.add(candidate)
+        return paths
+
+    def _sr_compute_target_overlap(self, changed_files: list[str], keywords: set[str], explicit_paths: set[str]) -> float:
+        """Step 3: compute overlap ratio."""
+        if not changed_files:
+            return 1.0  # nothing changed, no risk from overlap
+        hits = 0
+        for fpath in changed_files:
+            fpath_lower = fpath.lower()
+            # check explicit path match (higher priority)
+            if any(ep in fpath or fpath.endswith(ep) for ep in explicit_paths):
+                hits += 1
+                continue
+            # check keyword overlap with path components
+            parts = set(re.findall(r'[A-Za-z0-9_]+', fpath_lower))
+            if parts & keywords:
+                hits += 1
+        return hits / len(changed_files)
+
+    def _sr_compute_risk_signals(self, task: str) -> dict:
+        """Risk gate: gather signals via SSH, return metrics + should_review."""
+        # git diff --name-only
+        r1 = self.env.execute('git diff --name-only')
+        changed_files = [f for f in r1.get('output', '').strip().split('\n') if f.strip()]
+        changed_count = len(changed_files)
+
+        # git diff --numstat
+        r2 = self.env.execute('git diff --numstat')
+        diff_lines = 0
+        for line in r2.get('output', '').strip().split('\n'):
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                try:
+                    diff_lines += int(parts[0] if parts[0] != '-' else 0)
+                    diff_lines += int(parts[1] if parts[1] != '-' else 0)
+                except ValueError:
+                    pass
+
+        # keyword extraction
+        keywords = self._sr_extract_general_keywords(task)
+        explicit_paths = self._sr_extract_explicit_paths(task)
+        target_overlap = self._sr_compute_target_overlap(changed_files, keywords, explicit_paths)
+
+        # decide
+        reasons = []
+        if changed_count > self.sr_max_changed_files:
+            reasons.append(f'changed_files={changed_count} > {self.sr_max_changed_files}')
+        if diff_lines > self.sr_max_diff_lines:
+            reasons.append(f'diff_lines={diff_lines} > {self.sr_max_diff_lines}')
+        if target_overlap == 0 and changed_count > 0:
+            reasons.append('zero target overlap')
+
+        metrics = {
+            'changed_files': changed_count,
+            'changed_file_list': changed_files,
+            'diff_lines': diff_lines,
+            'target_overlap': round(target_overlap, 3),
+            'should_review': len(reasons) > 0,
+            'reasons': reasons,
+        }
+        return metrics
+
+    def _sr_truncate_diff(self, diff_text: str, max_chars: int = 12000, max_hunks: int = 60) -> str:
+        """Truncate diff to first max_chars or max_hunks, whichever comes first."""
+        hunks = _DIFF_HUNK_RE.findall(diff_text)
+        truncated = False
+        result = diff_text
+
+        if len(hunks) > max_hunks:
+            # find position of the (max_hunks+1)-th hunk marker
+            pos = 0
+            count = 0
+            for m in _DIFF_HUNK_RE.finditer(diff_text):
+                count += 1
+                if count > max_hunks:
+                    pos = m.start()
+                    break
+            if pos > 0:
+                result = diff_text[:pos]
+                truncated = True
+
+        if len(result) > max_chars:
+            result = result[:max_chars]
+            truncated = True
+
+        if truncated:
+            result += '\n[DIFF_TRUNCATED]'
+        return result
+
+    def _sr_run_critic(self, task: str, changed_files: list[str]) -> dict:
+        """Pass B: one LLM call to critique the diff. Returns parsed critic result."""
+        self.sr_extra_steps_used += 1
+
+        # collect diff
+        r = self.env.execute('git diff -U0')
+        raw_diff = r.get('output', '')
+        diff = self._sr_truncate_diff(raw_diff)
+
+        critic_messages = [
+            {'role': 'system', 'content': _CRITIC_SYSTEM},
+            {'role': 'user', 'content': _CRITIC_USER.format(
+                task_summary=task[:500],
+                changed_files='\n'.join(changed_files),
+                diff=diff,
+            )},
+        ]
+
+        try:
+            response = self.model.query(critic_messages)
+            raw_content = response.get('content', '')
+            print(f'[self-review] critic raw: {raw_content[:500]}')
+
+            # try to extract JSON from response (may have markdown fences)
+            json_match = re.search(r'\{[\s\S]*\}', raw_content)
+            if not json_match:
+                print('[self-review] critic parse failed: no JSON found')
+                return {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
+
+            parsed = json.loads(json_match.group())
+            return {
+                'risk_level': str(parsed.get('risk_level', 'low')),
+                'off_target': bool(parsed.get('off_target', False)),
+                'reasons': list(parsed.get('reasons', [])),
+                'actions': list(parsed.get('actions', [])),
+            }
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f'[self-review] critic parse failed: {e}')
+            return {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
+
+    def _sr_run_revise(self, actions: list[str]) -> None:
+        """Inject critic feedback and allow one revise cycle."""
+        self.sr_extra_steps_used += 1
+
+        # pop exit message(s) so agent can continue
+        while self.messages and self.messages[-1].get('role') == 'exit':
+            self.messages.pop()
+
+        feedback = (
+            "**Self-review critic found issues with your patch. Please fix before submitting.**\n\n"
+            "Required actions:\n" +
+            '\n'.join(f'- {a}' for a in actions) +
+            "\n\nAfter fixing, submit again with:\n"
+            "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```"
+        )
+        self.add_messages(self.model.format_message(role='user', content=feedback))
+
+        # mini step loop — allow some iterations for format errors etc.
+        for _ in range(15):
+            try:
+                self.step()
+            except InterruptAgentFlow as e:
+                self.add_messages(*e.messages)
+            except Exception:
+                break
+            if self.messages[-1].get('role') == 'exit':
+                break
+
+    def _sr_load_rules(self, task: str) -> list[str]:
+        """Load matching rules from rules_memory.json if it exists."""
+        rules_path = '/mnt/memory/rules_memory.json'
+        if not os.path.exists(rules_path):
+            return []
+        try:
+            with open(rules_path, 'r') as f:
+                rules = json.load(f)
+            if not isinstance(rules, list):
+                return []
+            task_lower = task.lower()
+            matching = []
+            for rule in rules[:50]:  # bounded scan
+                signal = str(rule.get('signal', '')).lower()
+                if signal and signal in task_lower:
+                    matching.append(str(rule.get('rule_text', '')))
+            return matching[:3]
+        except Exception:
+            return []
+
+    def _sr_log(self, **kwargs) -> None:
+        """Log self-review metrics to stdout."""
+        print(f'[self-review] {json.dumps(kwargs, default=str)}')
+
+    def _run_self_review(self, task: str, status, result):
+        """Orchestrate the self-review after Pass A. Returns (status, result), possibly revised."""
+        self._sr_log(enabled=True, phase='start')
+
+        # Risk gate
+        metrics = self._sr_compute_risk_signals(task)
+        self._sr_log(phase='risk_gate', **metrics)
+
+        if not metrics['should_review']:
+            self._sr_log(phase='skip', reason='risk gate not triggered')
+            return status, result
+
+        # Budget check
+        if self.sr_extra_steps_used >= self.sr_max_extra_steps:
+            self._sr_log(phase='skip', reason='extra step budget exhausted')
+            return status, result
+
+        # Pass B: critic
+        critic = self._sr_run_critic(task, metrics['changed_file_list'])
+        self._sr_log(phase='critic', **critic)
+
+        needs_revise = critic['off_target'] or critic['risk_level'] in ('medium', 'high')
+        if not needs_revise:
+            self._sr_log(phase='done', revise_applied=False, extra_steps_used=self.sr_extra_steps_used)
+            return status, result
+
+        # Budget check for revise
+        if self.sr_extra_steps_used >= self.sr_max_extra_steps:
+            self._sr_log(phase='skip_revise', reason='extra step budget exhausted after critic')
+            return status, result
+
+        # Revise
+        self._sr_log(phase='revise_start', actions=critic['actions'])
+        self._sr_run_revise(critic['actions'])
+
+        # extract new status/result from revised exit message
+        last_extra = self.messages[-1].get('extra', {}) if self.messages else {}
+        new_status = last_extra.get('exit_status', status)
+        new_result = last_extra.get('submission', result)
+
+        self._sr_log(phase='done', revise_applied=True, extra_steps_used=self.sr_extra_steps_used,
+                     new_status=str(new_status))
+        return new_status, new_result
+
+    # ------------------------------------------------------------------
+    # Core overrides
+    # ------------------------------------------------------------------
+
     def run(self, task: str):
         selected = self.pattern_memory.retrieve_for_task(task)
         self.pattern_prompt = self.pattern_memory.build_prompt_block(selected)
@@ -90,6 +405,10 @@ class MemoryAgent(DefaultAgent):
             print(f'retrieved {len(selected)} pattern memories')
 
         status, result = super().run(task)
+
+        # Self-review: only when enabled and agent submitted a patch
+        if self.sr_enabled and str(status).strip().lower() == 'submitted':
+            status, result = self._run_self_review(task, status, result)
 
         submitted = str(status).strip().lower() == 'submitted'
         self.pattern_memory.learn_from_run(task, self.messages[1:], submitted=submitted)
