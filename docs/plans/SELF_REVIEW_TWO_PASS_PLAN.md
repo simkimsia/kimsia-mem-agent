@@ -180,14 +180,23 @@ cd ~/projects/kimsia-mem-agent
 docker build -t kimsia-mem-agent:latest .
 ```
 
-### Step 4: Run the harness on VPS
+### Step 4: Clean up stale harness containers (recommended)
+
+```bash
+cd ~/projects/mem-comp-26/harness
+sudo docker ps -aq --filter "name=^/memcomp-" | xargs -r sudo docker rm -f
+```
+
+Why: old `memcomp-*` containers can cause name conflicts (HTTP 409) or stale run state.
+
+### Step 5: Run the harness on VPS
 
 ```bash
 cd ~/projects/mem-comp-26/harness
 sudo -E "$(pwd)/.venv/bin/python" main.py | tee run_selfreview_v1.log
 ```
 
-### Step 5: Check results
+### Step 6: Check results
 
 Inspect the log for `[self-review]` lines to see whether the risk gate triggered, what the critic said, and whether revise was applied. Then check verdict files against the validation gates below.
 
