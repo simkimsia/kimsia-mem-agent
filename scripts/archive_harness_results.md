@@ -20,7 +20,7 @@ It also:
 cd ~/projects/kimsia-mem-agent
 ./scripts/archive_harness_results.sh \
   --harness ~/projects/mem-comp-26/harness \
-  --label "baseline nomem v1 at 7/9 before two-pass self-review"
+  --label "twopass-selfreview v4 at 1/2 for element-web"
 ```
 
 ## Minimal usage (default harness path)

@@ -137,7 +137,7 @@ Before starting a new experiment, archive existing harness results so they don't
 cd ~/projects/kimsia-mem-agent
 ./scripts/archive_harness_results.sh \
   --harness ~/projects/mem-comp-26/harness \
-  --label "baseline nomem v1 at 7/9 before two-pass self-review"
+  --label "selfreview v2 at 1/3 after improve risk gate"
 ```
 
 See `scripts/archive_harness_results.md` for full usage details.
@@ -193,7 +193,7 @@ Why: old `memcomp-*` containers can cause name conflicts (HTTP 409) or stale run
 
 ```bash
 cd ~/projects/mem-comp-26/harness
-sudo -E "$(pwd)/.venv/bin/python" main.py | tee run_selfreview_v1.log
+sudo -E "$(pwd)/.venv/bin/python" main.py | tee run_selfreview_v1_2failed_element-web.log
 ```
 
 ### Step 6: Check results

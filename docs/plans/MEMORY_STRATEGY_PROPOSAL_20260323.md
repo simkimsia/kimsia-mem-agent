@@ -36,7 +36,7 @@ Use project-local memory as data:
 
 1. encode lessons as reusable records,
 2. inject as conditional checks,
-3. keep agent loop generic.
+3. keep core solving logic generic (allow only minimal hooks for memory checkpoints).
 
 ## What Is Actually Achievable
 
@@ -49,6 +49,11 @@ Use signals from commands/tests run by the agent during the same solve loop:
 3. feed into revise/checklist prompt before final submit command.
 
 This does not require persistence and works within one run.
+
+Implementation note:
+
+1. this requires a lightweight control-flow hook before accepting the final submit/exit,
+2. this is an explicit agent-loop change (small/instrumentation-level), not a pure memory-only change.
 
 ### 2) Inter-instance memory (same project, persisted)
 
@@ -70,6 +75,17 @@ First-wave retrieval should optimize precision over complexity:
 
 Optional defensive project filter remains acceptable for local mixed-run tooling, but not required for harness correctness.
 
+Specificity heuristic (0..1):
+
+1. +0.4 if memory contains concrete file path(s),
+2. +0.3 if it contains function/class/test identifier(s),
+3. +0.2 if it contains explicit failure signature (`Expected/Received`, assertion text, test name),
+4. -0.3 if content is generic advice without concrete anchors.
+
+Normalization rule:
+
+1. compute `specificity_raw` from weighted terms, then clamp: `specificity = clamp(specificity_raw, 0.0, 1.0)`.
+
 ## Memory Quality Without Eval Outcome Feedback
 
 Because evaluator outcomes are unavailable in-process, avoid claiming `success/failure` supervision from harness verdicts.
@@ -82,6 +98,16 @@ Use weak but available signals:
 4. whether agent's own rerun tests after edits improved (if present in trajectory).
 
 These are proxies, not ground-truth correctness.
+
+Episode-to-memory propagation rule:
+
+1. if episode ends crash/nopatch: do not persist new memories from that episode,
+2. if episode ends submitted patch: persist with base confidence 0.5, then adjust by memory specificity,
+3. retrieval downweights low-confidence memories rather than deleting immediately.
+
+Confidence normalization rule:
+
+1. any computed confidence must be clamped to `[0.0, 1.0]` before persistence or reranking.
 
 ## Extraction Upgrade (Feasible Inputs Only)
 
@@ -119,7 +145,7 @@ Extraction has non-trivial cost overhead.
 
 Policy:
 
-1. if remaining budget below threshold, skip LLM extraction and use heuristic-only extraction,
+1. if estimated remaining budget < $0.35, skip LLM extraction and use heuristic-only extraction,
 2. always prefer solving budget over memory extraction budget.
 
 ## Memory Pruning / Noise Control
@@ -130,7 +156,7 @@ Pruning policy:
 
 1. remove stale low-specificity memories,
 2. merge duplicates by normalized trigger/action,
-3. cap memory count per project and evict lowest utility first.
+3. cap memory count per project at **120** and evict lowest-utility first.
 
 ## Two-Pass / Semantic Self-Review Trigger
 
@@ -160,6 +186,13 @@ Reason:
 3. Specificity score (penalize broad/generic memories),
 4. memory growth vs retrieval quality trend,
 5. runtime/cost overhead.
+
+Manual audit protocol (explicit):
+
+1. reviewer: single-rater (project author),
+2. sample: 10 instances per experiment run (or all instances if run has <10),
+3. unit of judgment: every injected memory line in sampled instances,
+4. outputs: Precision@k and Irrelevant Injection Rate with raw counts.
 
 ## Rollout Order
 
