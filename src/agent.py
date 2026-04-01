@@ -352,7 +352,7 @@ class MemoryAgent(DefaultAgent):
             "Required actions:\n" +
             '\n'.join(f'- {a}' for a in actions) +
             "\n\nAfter fixing, submit again with:\n"
-            "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git reset && git add -u && git diff --cached\n```"
+            "```bash\nfind /app -maxdepth 1 \\( -name 'appendonly.aof*' -o -name '*.rdb' -o -name 'dump.rdb' -o -name 'implementation_summary.md' -o -name 'verify_*.js' -o -name 'verify_*.sh' -o -name 'test_*.js' \\) -delete && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git reset && git add -A && git restore --staged ':(glob)**/*.rdb' 'appendonly.aof*' 'dump.rdb' && git diff --cached\n```"
         )
         self._sr_push_messages(
             {
