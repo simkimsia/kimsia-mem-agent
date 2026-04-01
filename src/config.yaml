@@ -163,10 +163,12 @@ agent:
     issue exactly the following command:
 
     ```bash
-    find /app -maxdepth 1 \( -name 'appendonly.aof*' -o -name '*.rdb' -o -name 'dump.rdb' -o -name 'implementation_summary.md' -o -name 'verify_*.js' -o -name 'verify_*.sh' -o -name 'test_*.js' \) -delete && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git reset && git add -A && git restore --staged ':(glob)**/*.rdb' 'appendonly.aof*' 'dump.rdb' && git diff --cached
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
     ```
 
-    This command will submit your work.
+    This command will submit your work. The agent runtime will capture the patch
+    from the current working tree after you submit, so you do not need to run
+    any git staging or diff commands yourself.
     You cannot continue working (reading, editing, testing) in any way on this task after submitting.
     </instructions>
   action_observation_template: |

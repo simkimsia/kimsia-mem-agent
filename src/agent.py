@@ -37,6 +37,32 @@ _IDENTIFIER_RE = re.compile(r'[a-z]+[A-Z]|[A-Z][a-z]+[A-Z]|_|-')
 _PATH_RE = re.compile(r'(?:^|[\s\'"`(])([a-zA-Z0-9_./-]+\.(?:ts|tsx|js|jsx|py|rb|go|rs|java|c|cpp|h|hpp|css|scss|html))\b')
 _FULL_PATH_RE = re.compile(r'(?:^|[\s\'"`(])((?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+)\b')
 _DIFF_HUNK_RE = re.compile(r'^@@\s', re.MULTILINE)
+_SUBMISSION_EXCLUDE_PATTERNS = (
+    'appendonly.aof*',
+    '*.rdb',
+    'dump.rdb',
+    '__pycache__/',
+    '.pytest_cache/',
+    '.mypy_cache/',
+    '.ruff_cache/',
+    '.pyre/',
+    '.tox/',
+    '.nox/',
+    '.venv/',
+    'node_modules/',
+    '.npm/',
+    '.pnpm-store/',
+    '.yarn/',
+    '.parcel-cache/',
+    '.next/',
+    '.nuxt/',
+    '.svelte-kit/',
+    'coverage/',
+    'htmlcov/',
+    'dist/',
+    'build/',
+    'target/',
+)
 
 _CRITIC_SYSTEM = "You are a strict code-review critic. Respond with ONLY valid JSON, no markdown fences."
 _CRITIC_USER = """\
@@ -187,6 +213,30 @@ class MemoryAgent(DefaultAgent):
             if '/' in candidate and not candidate.startswith('http'):
                 paths.add(candidate)
         return paths
+
+    def _submission_prepare_snapshot(self) -> None:
+        """Stage a submission patch from the current working tree.
+
+        The agent prompt only emits the submit marker. Patch generation happens
+        here so we can consistently include valid new files while filtering
+        common generated junk using repo-local Git excludes.
+        """
+        exclude_lines = '\n'.join(_SUBMISSION_EXCLUDE_PATTERNS)
+        cmd = (
+            "mkdir -p .git/info && "
+            "cat <<'EOF' >> .git/info/exclude\n"
+            f"{exclude_lines}\n"
+            "EOF\n"
+            "git reset >/dev/null 2>&1 && "
+            "git add -A >/dev/null 2>&1"
+        )
+        self.env.execute(cmd)
+
+    def _submission_collect_patch(self) -> str:
+        """Return the staged patch using the normalized submission snapshot."""
+        self._submission_prepare_snapshot()
+        r = self.env.execute('git diff --cached')
+        return r.get('output', '')
 
     def _sr_compute_target_overlap(self, changed_files: list[str], keywords: set[str], explicit_paths: set[str]) -> float:
         """Step 3: compute overlap ratio."""
@@ -352,7 +402,7 @@ class MemoryAgent(DefaultAgent):
             "Required actions:\n" +
             '\n'.join(f'- {a}' for a in actions) +
             "\n\nAfter fixing, submit again with:\n"
-            "```bash\nfind /app -maxdepth 1 \\( -name 'appendonly.aof*' -o -name '*.rdb' -o -name 'dump.rdb' -o -name 'implementation_summary.md' -o -name 'verify_*.js' -o -name 'verify_*.sh' -o -name 'test_*.js' \\) -delete && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git reset && git add -A && git restore --staged ':(glob)**/*.rdb' 'appendonly.aof*' 'dump.rdb' && git diff --cached\n```"
+            "```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```"
         )
         self._sr_push_messages(
             {
@@ -412,6 +462,7 @@ class MemoryAgent(DefaultAgent):
     def _run_self_review(self, task: str, status, result):
         """Orchestrate the self-review after Pass A. Returns (status, result), possibly revised."""
         self._sr_log(enabled=True, phase='start')
+        self._submission_prepare_snapshot()
 
         # Risk gate
         metrics = self._sr_compute_risk_signals(task)
@@ -448,6 +499,8 @@ class MemoryAgent(DefaultAgent):
         last_extra = self.messages[-1].get('extra', {}) if self.messages else {}
         new_status = last_extra.get('exit_status', status)
         new_result = last_extra.get('submission', result)
+        if str(new_status).strip().lower() == 'submitted':
+            new_result = self._submission_collect_patch()
 
         self._sr_log(phase='done', revise_applied=True, extra_steps_used=self.sr_extra_steps_used,
                      new_status=str(new_status))
@@ -464,6 +517,8 @@ class MemoryAgent(DefaultAgent):
             print(f'retrieved {len(selected)} pattern memories')
 
         status, result = super().run(task)
+        if str(status).strip().lower() == 'submitted':
+            result = self._submission_collect_patch()
 
         # Self-review: only when enabled and agent submitted a patch
         if self.sr_enabled and str(status).strip().lower() == 'submitted':
