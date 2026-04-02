@@ -62,6 +62,41 @@ _SUBMISSION_EXCLUDE_PATTERNS = (
     'dist/',
     'build/',
     'target/',
+    '*.backup',
+    '*.bak',
+    '*.orig',
+    '*.rej',
+    '*.tmp',
+    '*.temp',
+    '*.swp',
+    '*.swo',
+    '*~',
+    'backup_*',
+    'temp_*',
+    'tmp_*',
+    'scratch_*',
+    '*_SUMMARY.md',
+    'CHANGES_SUMMARY.md',
+    'IMPLEMENTATION_SUMMARY.md',
+    'SOLUTION_SUMMARY.md',
+    'test_implementation.py',
+    'test_implementation.js',
+    'test_fix.js',
+    'verify_fix.js',
+    'final_validation.py',
+    'manual_test.sh',
+    'manual_test_v2.sh',
+    'requirements_check.sh',
+)
+
+_JUNK_FILE_RE = re.compile(
+    r'(^|/)(?:'
+    r'.*\.backup|.*\.bak|.*\.orig|.*\.rej|.*\.tmp|.*\.temp|'
+    r'backup_.*|temp_.*|tmp_.*|scratch_.*|'
+    r'.*_SUMMARY\.md|CHANGES_SUMMARY\.md|IMPLEMENTATION_SUMMARY\.md|SOLUTION_SUMMARY\.md|'
+    r'test_fix\.js|verify_fix\.js|final_validation\.py|manual_test(?:_v2)?\.sh|requirements_check\.sh'
+    r')$',
+    re.IGNORECASE,
 )
 
 _CRITIC_SYSTEM = "You are a strict code-review critic. Respond with ONLY valid JSON, no markdown fences."
@@ -77,6 +112,8 @@ Diff (-U0, possibly truncated):
 
 Question: Is this patch off-target or risky?
 If yes, list exact corrective actions the developer should take.
+Treat backup files, summary markdown, scratch scripts, and one-off validation/demo files as strong negative signals.
+Prefer localized edits in existing repository files. Flag patches that solve the task with ad hoc helper files instead of repo-native changes.
 
 Respond with ONLY this JSON schema:
 {{"risk_level": "low|medium|high", "off_target": true/false, "reasons": ["..."], "actions": ["..."]}}"""
@@ -294,6 +331,11 @@ class MemoryAgent(DefaultAgent):
             reasons.append(f'diff_lines={diff_lines} > {self.sr_max_diff_lines}')
         if target_overlap == 0 and changed_count > 0:
             reasons.append('zero target overlap')
+        if 0 < target_overlap < 0.5 and changed_count >= 2:
+            reasons.append(f'low target overlap={target_overlap:.3f}')
+        junk_files = [f for f in changed_files if _JUNK_FILE_RE.search(f)]
+        if junk_files:
+            reasons.append('junk files in patch')
 
         metrics = {
             'changed_files': changed_count,
@@ -301,6 +343,7 @@ class MemoryAgent(DefaultAgent):
             'diff_source': diff_source,
             'diff_lines': diff_lines,
             'target_overlap': round(target_overlap, 3),
+            'junk_file_list': junk_files,
             'should_review': len(reasons) > 0,
             'reasons': reasons,
         }
