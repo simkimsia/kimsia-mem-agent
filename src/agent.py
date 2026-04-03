@@ -37,6 +37,7 @@ _IDENTIFIER_RE = re.compile(r'[a-z]+[A-Z]|[A-Z][a-z]+[A-Z]|_|-')
 _PATH_RE = re.compile(r'(?:^|[\s\'"`(])([a-zA-Z0-9_./-]+\.(?:ts|tsx|js|jsx|py|rb|go|rs|java|c|cpp|h|hpp|css|scss|html))\b')
 _FULL_PATH_RE = re.compile(r'(?:^|[\s\'"`(])((?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+)\b')
 _DIFF_HUNK_RE = re.compile(r'^@@\s', re.MULTILINE)
+_WHITESPACE_RE = re.compile(r'\s+')
 _SUBMISSION_EXCLUDE_PATTERNS = (
     'appendonly.aof*',
     '*.rdb',
@@ -98,6 +99,19 @@ _JUNK_FILE_RE = re.compile(
     r')$',
     re.IGNORECASE,
 )
+_STRUCTURAL_LINE_RE = re.compile(
+    r'^(?:'
+    r'(?:else\s+)?if\b|'
+    r'return\b|'
+    r'case\b|'
+    r'switch\b|'
+    r'(?:public|private|protected)\b|'
+    r'(?:const|let|var)\b|'
+    r'this\.|'
+    r'super\.|'
+    r'[A-Za-z_][A-Za-z0-9_.]*\s*[:=]'
+    r')'
+)
 
 _CRITIC_SYSTEM = "You are a strict code-review critic. Respond with ONLY valid JSON, no markdown fences."
 _CRITIC_USER = """\
@@ -107,13 +121,18 @@ Task summary (first 500 chars):
 Changed files:
 {changed_files}
 
+Observed risk signals:
+{risk_signals}
+
 Diff (-U0, possibly truncated):
 {diff}
 
 Question: Is this patch off-target or risky?
 If yes, list exact corrective actions the developer should take.
+Prioritize structural correctness over patch size.
+Treat malformed code, duplicated branches or assignments, partial rewrites, and patches likely to wedge validation as strong negative signals.
 Treat backup files, summary markdown, scratch scripts, and one-off validation/demo files as strong negative signals.
-Prefer localized edits in existing repository files. Flag patches that solve the task with ad hoc helper files instead of repo-native changes.
+Do not penalize repo-native helper files when they are relevant and integrated cleanly.
 
 Respond with ONLY this JSON schema:
 {{"risk_level": "low|medium|high", "off_target": true/false, "reasons": ["..."], "actions": ["..."]}}"""
@@ -275,6 +294,49 @@ class MemoryAgent(DefaultAgent):
         r = self.env.execute('git diff --cached')
         return r.get('output', '')
 
+    def _sr_normalize_added_line(self, line: str) -> str:
+        line = _WHITESPACE_RE.sub(' ', line.strip())
+        return line.rstrip(',;')
+
+    def _sr_detect_structural_risks(self, diff_text: str) -> list[str]:
+        """Look for malformed diff patterns that often indicate shell-edit corruption."""
+        reasons = []
+        recent_added = []
+        duplicate_structural_lines = set()
+        blank_run = 0
+
+        for raw_line in diff_text.splitlines():
+            if raw_line.startswith('diff --git ') or raw_line.startswith('@@'):
+                recent_added = []
+                blank_run = 0
+                continue
+
+            if raw_line.startswith('+') and not raw_line.startswith('+++'):
+                content = raw_line[1:]
+                normalized = self._sr_normalize_added_line(content)
+                if not normalized:
+                    blank_run += 1
+                    if blank_run >= 3:
+                        reasons.append('runs of added blank lines suggest patch corruption')
+                    continue
+
+                blank_run = 0
+                if _STRUCTURAL_LINE_RE.search(normalized):
+                    if normalized in recent_added[-8:]:
+                        duplicate_structural_lines.add(normalized)
+                recent_added.append(normalized)
+                if len(recent_added) > 12:
+                    recent_added = recent_added[-12:]
+                continue
+
+            if not raw_line.startswith('-'):
+                blank_run = 0
+
+        if duplicate_structural_lines:
+            sample = sorted(duplicate_structural_lines)[:3]
+            reasons.append(f'duplicate added structural lines: {sample}')
+        return reasons
+
     def _sr_compute_target_overlap(self, changed_files: list[str], keywords: set[str], explicit_paths: set[str]) -> float:
         """Step 3: compute overlap ratio."""
         if not changed_files:
@@ -322,6 +384,8 @@ class MemoryAgent(DefaultAgent):
         keywords = self._sr_extract_general_keywords(task)
         explicit_paths = self._sr_extract_explicit_paths(task)
         target_overlap = self._sr_compute_target_overlap(changed_files, keywords, explicit_paths)
+        diff_preview = self._submission_collect_patch()
+        structural_reasons = self._sr_detect_structural_risks(diff_preview)
 
         # decide
         reasons = []
@@ -331,11 +395,10 @@ class MemoryAgent(DefaultAgent):
             reasons.append(f'diff_lines={diff_lines} > {self.sr_max_diff_lines}')
         if target_overlap == 0 and changed_count > 0:
             reasons.append('zero target overlap')
-        if 0 < target_overlap < 0.5 and changed_count >= 2:
-            reasons.append(f'low target overlap={target_overlap:.3f}')
         junk_files = [f for f in changed_files if _JUNK_FILE_RE.search(f)]
         if junk_files:
             reasons.append('junk files in patch')
+        reasons.extend(structural_reasons)
 
         metrics = {
             'changed_files': changed_count,
@@ -344,6 +407,7 @@ class MemoryAgent(DefaultAgent):
             'diff_lines': diff_lines,
             'target_overlap': round(target_overlap, 3),
             'junk_file_list': junk_files,
+            'structural_signal_list': structural_reasons,
             'should_review': len(reasons) > 0,
             'reasons': reasons,
         }
@@ -376,7 +440,7 @@ class MemoryAgent(DefaultAgent):
             result += '\n[DIFF_TRUNCATED]'
         return result
 
-    def _sr_run_critic(self, task: str, changed_files: list[str]) -> dict:
+    def _sr_run_critic(self, task: str, metrics: dict) -> dict:
         """Pass B: one LLM call to critique the diff. Returns parsed critic result."""
         self.sr_extra_steps_used += 1
         fallback = {'risk_level': 'low', 'off_target': False, 'reasons': [], 'actions': []}
@@ -393,7 +457,8 @@ class MemoryAgent(DefaultAgent):
             {'role': 'system', 'content': _CRITIC_SYSTEM},
             {'role': 'user', 'content': _CRITIC_USER.format(
                 task_summary=task[:500],
-                changed_files='\n'.join(changed_files),
+                changed_files='\n'.join(metrics.get('changed_file_list', [])),
+                risk_signals='\n'.join(metrics.get('reasons', [])) or '(none)',
                 diff=diff,
             )},
         ]
@@ -521,7 +586,7 @@ class MemoryAgent(DefaultAgent):
             return status, result
 
         # Pass B: critic
-        critic = self._sr_run_critic(task, metrics['changed_file_list'])
+        critic = self._sr_run_critic(task, metrics)
         self._sr_log(phase='critic', **critic)
 
         needs_revise = critic['off_target'] or critic['risk_level'] in ('medium', 'high')
