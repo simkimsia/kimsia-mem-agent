@@ -55,7 +55,6 @@ agent:
     - Reuse existing helpers and components before introducing new abstractions
     - Introduce repo-native helpers or files when they make the fix clearer or safer
     - If you need to verify behavior, prefer existing tests or project scripts over custom one-off scripts
-    - If a command would leave behind a backup or scratch file, choose a different approach
 
     ## Command Execution Rules
     You are operating in an environment where
