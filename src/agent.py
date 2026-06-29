@@ -633,6 +633,21 @@ class MemoryAgent(DefaultAgent):
     def _vg_log(self, **kwargs) -> None:
         print(f'[verify-gate] {json.dumps(kwargs, default=str)}')
 
+    def _vg_real_errors(self, output: str) -> list[str]:
+        """Type-error lines attributable to the patch — `tsc`/`lint:types` lines of the
+        form `path(line,col): error TS####: ...`, excluding `node_modules/` (pre-existing
+        baseline noise the repo ships with and that the eval does not hold the agent to)."""
+        errs = []
+        for line in output.splitlines():
+            if 'error TS' not in line:
+                continue
+            m = re.match(r'\s*([^\s(]+)\(\d+,\d+\):\s*error TS', line)
+            path = m.group(1) if m else ''
+            if path.startswith('node_modules/') or '/node_modules/' in path:
+                continue
+            errs.append(line.strip())
+        return errs
+
     def _vg_resolve_verify(self, changed_files: list[str]) -> tuple[str, str]:
         """Resolve (cwd, verify_cmd) at runtime from the staged changed files.
 
@@ -720,21 +735,37 @@ echo "CMD=$CMD"
         while True:
             vr = self.env.execute(exec_cmd, cwd=cwd, timeout=self.vg_timeout)
             rc = vr.get('returncode', -1)
-            if rc == 0:
-                self._vg_log(phase='pass', bounces_used=self.vg_bounces_used)
+            out = vr.get('output', '')
+            real_errs = self._vg_real_errors(out)
+            had_any_ts = 'error TS' in out
+
+            # Pass = no type errors attributable to the patch. The repo's lint:types
+            # is NOT clean at baseline (element-web bundles node_modules/matrix-js-sdk
+            # with ~3 pre-existing TS errors), so rc!=0 alone is not a fail signal —
+            # only NON-node_modules errors (baseline src/test is clean) count.
+            if not real_errs:
+                if rc != 0 and not had_any_ts:
+                    # command did not actually run a typecheck (e.g. missing script,
+                    # tooling error) -> not a valid verdict, do NOT bounce or pass-bounce.
+                    self._vg_log(phase='gate_error', returncode=rc, output_head=out[:300])
+                else:
+                    self._vg_log(phase='pass', returncode=rc,
+                                 baseline_noise_ignored=had_any_ts,
+                                 bounces_used=self.vg_bounces_used)
                 return status, result
 
             if self.vg_bounces_used >= self.vg_max_bounces:
-                self._vg_log(phase='exhausted', returncode=rc, bounces_used=self.vg_bounces_used,
-                             final_status=str(status))
+                self._vg_log(phase='exhausted', returncode=rc, real_errors=len(real_errs),
+                             bounces_used=self.vg_bounces_used, final_status=str(status))
                 return status, result
 
             self.vg_bounces_used += 1
-            errors = self._sr_truncate_diff(vr.get('output', ''), max_chars=6000)
-            self._vg_log(phase='bounce', returncode=rc, bounce=self.vg_bounces_used)
+            errors = self._sr_truncate_diff('\n'.join(real_errs), max_chars=6000)
+            self._vg_log(phase='bounce', returncode=rc, real_errors=len(real_errs),
+                         bounce=self.vg_bounces_used)
             self._sr_run_revise([
-                'The forced pre-submit type check failed. Fix the type errors below, '
-                f'then submit again.\n\n$ {cmd}\n{errors}'
+                'The forced pre-submit type check found type errors introduced by your '
+                f'patch. Fix them, then submit again.\n\n$ {cmd}\n{errors}'
             ])
 
             # re-extract status/result from the revised exit message
