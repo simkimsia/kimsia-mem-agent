@@ -3,6 +3,7 @@ import re
 import json
 import time
 import random
+import shlex
 import requests
 from minisweagent.agents.default import DefaultAgent, LimitsExceeded
 try:
@@ -159,6 +160,16 @@ class MemoryAgent(DefaultAgent):
         self.sr_max_changed_files = int(os.environ.get('SELF_REVIEW_MAX_CHANGED_FILES', '3'))
         self.sr_max_diff_lines = int(os.environ.get('SELF_REVIEW_MAX_DIFF_LINES', '120'))
         self.sr_extra_steps_used = 0
+
+        # Forced pre-submit verification gate (Phase 2 causal arm — off by default).
+        # Independent of self-review; the gate arm runs with SELF_REVIEW_ENABLED=0 to
+        # isolate the forced-verify IV. Fires UNCONDITIONALLY at submit, bounces on a
+        # non-zero typecheck, re-runs the agent to fix, up to VERIFY_GATE_MAX_BOUNCES.
+        self.vg_enabled = os.environ.get('VERIFY_GATE_ENABLED', '0') == '1'
+        self.vg_timeout = int(os.environ.get('VERIFY_GATE_TIMEOUT', '300'))
+        self.vg_max_bounces = int(os.environ.get('VERIFY_GATE_MAX_BOUNCES', '2'))
+        self.vg_bounces_used = 0
+
         self.query_max_retries = int(os.environ.get('MODEL_QUERY_MAX_RETRIES', '6'))
         self.query_backoff_base_s = float(os.environ.get('MODEL_QUERY_BACKOFF_BASE_S', '1.0'))
         self.query_backoff_max_s = float(os.environ.get('MODEL_QUERY_BACKOFF_MAX_S', '20.0'))
@@ -169,6 +180,8 @@ class MemoryAgent(DefaultAgent):
         if self.sr_enabled:
             print(f'self-review enabled: max_extra_steps={self.sr_max_extra_steps}, '
                   f'max_changed_files={self.sr_max_changed_files}, max_diff_lines={self.sr_max_diff_lines}')
+        if self.vg_enabled:
+            print(f'verify-gate enabled: timeout={self.vg_timeout}s, max_bounces={self.vg_max_bounces}')
 
     def _compact_messages(self, messages: list[dict]) -> list[dict]:
         compacted = []
@@ -615,6 +628,118 @@ class MemoryAgent(DefaultAgent):
         return new_status, new_result
 
     # ------------------------------------------------------------------
+    # Forced pre-submit verification gate (Phase 2 causal arm)
+    # ------------------------------------------------------------------
+    def _vg_log(self, **kwargs) -> None:
+        print(f'[verify-gate] {json.dumps(kwargs, default=str)}')
+
+    def _vg_resolve_verify(self, changed_files: list[str]) -> tuple[str, str]:
+        """Resolve (cwd, verify_cmd) at runtime from the staged changed files.
+
+        Commit-robust: the container has the repo at the exact instance commit, so we
+        derive the owning package dir (root for single-package repos like element-web;
+        the applications/*|packages/* ancestor for monorepos like webclients) and run
+        that dir's own typecheck script, falling back to `npx tsc --noEmit`. No per-repo
+        or per-commit config to maintain.
+        """
+        ts_files = [f for f in changed_files if f.endswith(('.ts', '.tsx'))]
+        candidates = ts_files or changed_files
+        if not candidates:
+            return '', ''
+
+        files_arg = ' '.join(shlex.quote(f) for f in candidates)
+        script = f"""
+set -e
+resolve() {{
+  for f in {files_arg}; do
+    d=$(dirname "$f")
+    while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do
+      if [ -f "$d/package.json" ]; then echo "$d"; return; fi
+      d=$(dirname "$d")
+    done
+  done
+  if [ -f package.json ]; then echo "."; fi
+}}
+PKGDIR=$(resolve)
+if [ -z "$PKGDIR" ]; then echo "PKGDIR="; echo "CMD="; exit 0; fi
+PJ="$PKGDIR/package.json"
+if grep -q '"lint:types"' "$PJ" 2>/dev/null; then CMD="yarn lint:types";
+elif grep -q '"check-types"' "$PJ" 2>/dev/null; then CMD="yarn check-types";
+else CMD="npx tsc --noEmit"; fi
+echo "PKGDIR=$PKGDIR"
+echo "CMD=$CMD"
+"""
+        r = self.env.execute(script)
+        pkgdir, cmd = '', ''
+        for line in r.get('output', '').splitlines():
+            if line.startswith('PKGDIR='):
+                pkgdir = line[len('PKGDIR='):].strip()
+            elif line.startswith('CMD='):
+                cmd = line[len('CMD='):].strip()
+        # env.execute resolves a relative cwd against the SSH home dir, not the repo,
+        # so anchor the package dir to the repo root (env's default cwd).
+        repo_root = self.env.config.cwd
+        if pkgdir in ('', '.'):
+            cwd = repo_root  # repo root
+        elif pkgdir.startswith('/'):
+            cwd = pkgdir
+        else:
+            cwd = f'{repo_root.rstrip("/")}/{pkgdir}' if repo_root else pkgdir
+        return cwd, cmd
+
+    def _vg_run_gate(self, task: str, status, result):
+        """Force a typecheck before accepting the submit; bounce the agent on failure.
+
+        Returns (status, result), possibly revised after one or more fix cycles.
+        """
+        self._vg_log(phase='start')
+        self._submission_prepare_snapshot()
+
+        r = self.env.execute('git diff --cached --name-only')
+        changed_files = [f for f in r.get('output', '').strip().split('\n') if f.strip()]
+        if not changed_files:
+            self._vg_log(phase='skip', reason='no staged changes')
+            return status, result
+
+        cwd, cmd = self._vg_resolve_verify(changed_files)
+        if not cmd:
+            self._vg_log(phase='skip', reason='no verify command resolved',
+                         changed_files=len(changed_files))
+            return status, result
+        self._vg_log(phase='resolved', cwd=cwd or '.', cmd=cmd, changed_files=len(changed_files))
+
+        while True:
+            vr = self.env.execute(cmd, cwd=cwd, timeout=self.vg_timeout)
+            rc = vr.get('returncode', -1)
+            if rc == 0:
+                self._vg_log(phase='pass', bounces_used=self.vg_bounces_used)
+                return status, result
+
+            if self.vg_bounces_used >= self.vg_max_bounces:
+                self._vg_log(phase='exhausted', returncode=rc, bounces_used=self.vg_bounces_used,
+                             final_status=str(status))
+                return status, result
+
+            self.vg_bounces_used += 1
+            errors = self._sr_truncate_diff(vr.get('output', ''), max_chars=6000)
+            self._vg_log(phase='bounce', returncode=rc, bounce=self.vg_bounces_used)
+            self._sr_run_revise([
+                'The forced pre-submit type check failed. Fix the type errors below, '
+                f'then submit again.\n\n$ {cmd}\n{errors}'
+            ])
+
+            # re-extract status/result from the revised exit message
+            last_extra = self.messages[-1].get('extra', {}) if self.messages else {}
+            status = last_extra.get('exit_status', status)
+            result = last_extra.get('submission', result)
+            if str(status).strip().lower() == 'submitted':
+                self._submission_prepare_snapshot()
+                result = self._submission_collect_patch()
+            else:
+                self._vg_log(phase='abandoned', new_status=str(status))
+                return status, result
+
+    # ------------------------------------------------------------------
     # Core overrides
     # ------------------------------------------------------------------
 
@@ -634,6 +759,13 @@ class MemoryAgent(DefaultAgent):
                 status, result = self._run_self_review(task, status, result)
             except Exception as e:
                 self._sr_log(phase='error', error=str(e))
+
+        # Forced verification gate: only when enabled and agent submitted a patch
+        if self.vg_enabled and str(status).strip().lower() == 'submitted':
+            try:
+                status, result = self._vg_run_gate(task, status, result)
+            except Exception as e:
+                self._vg_log(phase='error', error=str(e))
 
         submitted = str(status).strip().lower() == 'submitted'
         self.pattern_memory.learn_from_run(task, self.messages[1:], submitted=submitted)
