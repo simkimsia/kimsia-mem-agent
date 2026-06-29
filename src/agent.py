@@ -708,8 +708,17 @@ echo "CMD=$CMD"
             return status, result
         self._vg_log(phase='resolved', cwd=cwd or '.', cmd=cmd, changed_files=len(changed_files))
 
+        # env.execute runs via a non-interactive sshd shell whose PATH lacks
+        # /usr/local/bin (where yarn/node/npx live) -> a bare `yarn` returns 127
+        # (command-not-found) instead of running the typecheck. Restore the full
+        # interactive PATH so the resolved verify command actually runs.
+        exec_cmd = (
+            'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; '
+            f'{cmd}'
+        )
+
         while True:
-            vr = self.env.execute(cmd, cwd=cwd, timeout=self.vg_timeout)
+            vr = self.env.execute(exec_cmd, cwd=cwd, timeout=self.vg_timeout)
             rc = vr.get('returncode', -1)
             if rc == 0:
                 self._vg_log(phase='pass', bounces_used=self.vg_bounces_used)
