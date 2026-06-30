@@ -26,6 +26,9 @@ class PatternMemory:
         self.allow_fallback_retrieval = (
             os.environ.get("MEMORY_ALLOW_FALLBACK_RETRIEVAL", "0").strip() == "1"
         )
+        self.verification_aware = (
+            os.environ.get("MEMORY_VERIFICATION_AWARE", "0").strip() == "1"
+        )
         self.last_retrieved_ids: list[str] = []
         self._warned_fallback = False
         self._embedding_ok = True
@@ -161,6 +164,26 @@ class PatternMemory:
             "git diff",
             "git status",
         )
+        # FIX arm: verification cmds = the agent checking its own edit compiles/typechecks/tests.
+        verification_prefixes = (
+            "tsc",
+            "npx tsc",
+            "yarn tsc",
+            "yarn lint:types",
+            "yarn check-types",
+            "yarn typecheck",
+            "yarn test",
+            "npm test",
+            "npm run test",
+            "jest",
+            "npx jest",
+            "python -m py_compile",
+            "python -m pytest",
+            "pytest",
+            "go build",
+            "go test",
+            "go vet",
+        )
         banned_substrings = (
             "cat <<",
             "cat >",
@@ -174,6 +197,16 @@ class PatternMemory:
             "yarn ",
             "npm ",
         )
+        if self.verification_aware:
+            # stop banning verify cmds; keep a NARROW ban so we still skip dependency installs
+            banned_substrings = tuple(
+                b
+                for b in banned_substrings
+                if b not in ("node --check", "yarn ", "npm ")
+            ) + ("yarn add", "yarn install", "npm install", "npm i ", "npm ci")
+            allow = allowed_prefixes + verification_prefixes
+        else:
+            allow = allowed_prefixes
 
         for message in messages:
             if message.get("role") != "assistant":
@@ -192,7 +225,7 @@ class PatternMemory:
                     lowered = part.lower()
                     if any(token in lowered for token in banned_substrings):
                         continue
-                    if not lowered.startswith(allowed_prefixes):
+                    if not lowered.startswith(allow):
                         continue
                     key = lowered
                     if key in seen:
