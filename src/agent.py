@@ -115,6 +115,22 @@ _STRUCTURAL_LINE_RE = re.compile(
 )
 
 _CRITIC_SYSTEM = "You are a strict code-review critic. Respond with ONLY valid JSON, no markdown fences."
+
+# Behavioral self-test loop (prompt-level v1, gated by BEHAVIORAL_SELFTEST=1). Standing
+# instruction injected like the pattern-memory block. Scratch-and-delete: the test is a
+# throwaway run for an execution signal, removed before submit so the final diff stays
+# clean (instance_template L41/L182). The write+run commands persist in agent.log for mining.
+_BEHAVIORAL_SELFTEST_PROMPT = (
+    "BEHAVIORAL SELF-TEST (required before you submit):\n"
+    "1. Write a SCRATCH test that encodes the exact behavior the PR description requires "
+    "(reproduce the bug / assert the new behavior). Put it in a throwaway path, e.g. /tmp.\n"
+    "2. Run it with the repo's own runner (yarn test <file> / jest <file>) and read the real error.\n"
+    "3. Iterate your SOURCE fix and re-run until YOUR test passes for the right reason "
+    "(do not weaken the assertion just to make it green).\n"
+    "4. DELETE the scratch test before submitting — the final diff must contain only the "
+    "source fix, no test or scratch artifacts.\n"
+    "Do not submit until your own behavioral test passes (within the step/cost budget)."
+)
 _CRITIC_USER = """\
 Task summary (first 500 chars):
 {task_summary}
@@ -170,6 +186,12 @@ class MemoryAgent(DefaultAgent):
         self.vg_max_bounces = int(os.environ.get('VERIFY_GATE_MAX_BOUNCES', '2'))
         self.vg_bounces_used = 0
 
+        # Behavioral self-test loop (prompt-level v1 — off by default → baseline byte-identical).
+        # Standing instruction injected like the pattern-memory block; isolates the
+        # write-a-test-and-run-it variable (run with gate off, SR=1, no vaware memory).
+        self.bst_enabled = os.environ.get('BEHAVIORAL_SELFTEST', '0') == '1'
+        self.behavior_prompt = _BEHAVIORAL_SELFTEST_PROMPT if self.bst_enabled else ""
+
         self.query_max_retries = int(os.environ.get('MODEL_QUERY_MAX_RETRIES', '6'))
         self.query_backoff_base_s = float(os.environ.get('MODEL_QUERY_BACKOFF_BASE_S', '1.0'))
         self.query_backoff_max_s = float(os.environ.get('MODEL_QUERY_BACKOFF_MAX_S', '20.0'))
@@ -182,6 +204,8 @@ class MemoryAgent(DefaultAgent):
                   f'max_changed_files={self.sr_max_changed_files}, max_diff_lines={self.sr_max_diff_lines}')
         if self.vg_enabled:
             print(f'verify-gate enabled: timeout={self.vg_timeout}s, max_bounces={self.vg_max_bounces}')
+        if self.bst_enabled:
+            print('behavioral-selftest enabled')
 
     def _compact_messages(self, messages: list[dict]) -> list[dict]:
         compacted = []
@@ -854,8 +878,18 @@ echo "CMD=$CMD"
                     "timestamp": time.time(),
                 }
             )
+        behavior_block = []
+        if self.behavior_prompt:
+            behavior_block.append(
+                {
+                    "role": "user",
+                    "content": self.behavior_prompt,
+                    "timestamp": time.time(),
+                }
+            )
         messages = [
             *self.messages[:1],
+            *behavior_block,
             *pattern_block,
             *self.memorized_messages,
             *self.messages[1:]
